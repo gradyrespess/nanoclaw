@@ -40,6 +40,58 @@ const server = new McpServer({
 });
 
 server.tool(
+  'send_screenshot',
+  "Send a screenshot to the user via Discord (or whatever channel they're on) and optionally ask them a question. Use this when you need the user to see what's on screen — e.g., for 2FA codes, Duo prompts, or visual confirmation. After calling this, the user's reply will arrive as a new message in your conversation. To wait for it, use: Bash('sleep 25')",
+  {
+    screenshot_path: z.string().describe(
+      'Path to the screenshot PNG (e.g., /workspace/group/duo.png or /tmp/screenshots/screenshot-123.png). Files outside /workspace/group are copied there automatically.',
+    ),
+    text: z.string().describe(
+      'Message to send alongside the screenshot (e.g., "What is the Duo code showing on your phone? Reply with just the 6-digit code.")',
+    ),
+  },
+  async (args) => {
+    let relPath: string;
+
+    if (args.screenshot_path.startsWith('/workspace/group/')) {
+      relPath = args.screenshot_path.slice('/workspace/group/'.length);
+    } else {
+      // Copy into the shared group folder so the host can read it
+      const filename = `screenshot-${Date.now()}.png`;
+      const dest = `/workspace/group/${filename}`;
+      try {
+        fs.copyFileSync(args.screenshot_path, dest);
+        relPath = filename;
+      } catch (err) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Failed to copy screenshot to shared folder: ${err instanceof Error ? err.message : String(err)}`,
+          }],
+          isError: true,
+        };
+      }
+    }
+
+    writeIpcFile(MESSAGES_DIR, {
+      type: 'message_with_image',
+      chatJid,
+      text: args.text,
+      image_group_relative_path: relPath,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    });
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: "Screenshot sent. The user's reply will arrive as a new message. Use Bash('sleep 25') to wait up to 25 seconds for their response.",
+      }],
+    };
+  },
+);
+
+server.tool(
   'send_message',
   "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times.",
   {

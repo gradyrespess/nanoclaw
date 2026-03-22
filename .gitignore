@@ -21,6 +21,8 @@ groups/global/*
 # Secrets
 *.keys.json
 .env
+scripts/.bb-creds.json
+scripts/.gcal-token.json
 
 # Temp files
 .tmp-*

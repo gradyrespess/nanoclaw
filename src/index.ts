@@ -1,3 +1,4 @@
+import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -28,9 +29,11 @@ import {
 } from './container-runtime.js';
 import {
   getAllChats,
+  getAllPendingBudgetTransactions,
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
+  findPendingBudgetTransactionByMerchant,
   getMessagesSince,
   getNewMessages,
   getRegisteredGroup,
@@ -58,17 +61,28 @@ import {
   shouldDropMessage,
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
+import { classifyTier } from './tier-router.js';
+import {
+  estimateTokens,
+  getWeeklyCostReport,
+  logTierUsage,
+} from './cost-tracker.js';
+import { getCacheEntry, setCacheEntry } from './db.js';
+import { BudgetTracker } from './budget-tracker.js';
+import { MorningBriefing } from './morning-briefing.js';
+import { BlackboardPortal } from './blackboard-portal.js';
+import { SmsChannel } from './channels/sms.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
-// Re-export for backwards compatibility during refactor
-export { escapeXml, formatMessages } from './router.js';
+export { formatMessages } from './router.js';
 
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+let budgetTracker: BudgetTracker | null = null;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -180,7 +194,63 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
-  const prompt = formatMessages(missedMessages, TIMEZONE);
+  // --- Tier classification ---
+  const tierDecision = classifyTier(missedMessages, group.folder, false);
+  logger.info(
+    { group: group.name, tier: tierDecision.tier, reason: tierDecision.reason },
+    'Tier classified',
+  );
+
+  // Tier 1: instant response — no API call, no container
+  if (tierDecision.tier === 1 && tierDecision.instantResponse) {
+    await channel.sendMessage(chatJid, tierDecision.instantResponse);
+    lastAgentTimestamp[chatJid] =
+      missedMessages[missedMessages.length - 1].timestamp;
+    saveState();
+    logTierUsage({
+      tier: 1,
+      model: null,
+      groupFolder: group.folder,
+      isCacheHit: false,
+      estimatedInputTokens: 0,
+      estimatedOutputTokens: 0,
+      promptPreview: missedMessages[missedMessages.length - 1].content,
+    });
+    return true;
+  }
+
+  // Cache check for Tier 2 (cacheable) responses
+  if (tierDecision.cacheable) {
+    const cached = getCacheEntry(tierDecision.cacheKey);
+    if (cached) {
+      await channel.sendMessage(chatJid, cached);
+      lastAgentTimestamp[chatJid] =
+        missedMessages[missedMessages.length - 1].timestamp;
+      saveState();
+      logger.info(
+        { group: group.name, tier: tierDecision.tier },
+        'Cache hit — skipped API call',
+      );
+      logTierUsage({
+        tier: tierDecision.tier,
+        model: tierDecision.model,
+        groupFolder: group.folder,
+        isCacheHit: true,
+        estimatedInputTokens: estimateTokens(
+          missedMessages.map((m) => m.content).join(' '),
+        ),
+        estimatedOutputTokens: 0,
+        promptPreview: missedMessages[missedMessages.length - 1].content,
+      });
+      return true;
+    }
+  }
+
+  const basePrompt = formatMessages(missedMessages, TIMEZONE);
+  const budgetContext = isMainGroup ? getBudgetContext(missedMessages) : null;
+  const prompt = budgetContext
+    ? `${budgetContext}\n\n${basePrompt}`
+    : basePrompt;
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -211,36 +281,70 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
+  let agentResponse = '';
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+  const output = await runAgent(
+    group,
+    prompt,
+    chatJid,
+    tierDecision.model ?? undefined,
+    async (result) => {
+      // Streaming output callback — called for each agent result
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info(
+          { group: group.name },
+          `Agent output: ${raw.slice(0, 200)}`,
+        );
+        if (text) {
+          agentResponse += text;
+          await channel.sendMessage(chatJid, text);
+          outputSentToUser = true;
+        }
+        // Only reset idle timer on actual results, not session-update markers (result: null)
+        resetIdleTimer();
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+      }
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    },
+  );
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
+
+  // Log tier usage after we know the response size
+  const inputTokens = estimateTokens(prompt);
+  const outputTokens = estimateTokens(agentResponse);
+  logTierUsage({
+    tier: tierDecision.tier,
+    model: tierDecision.model,
+    groupFolder: group.folder,
+    isCacheHit: false,
+    estimatedInputTokens: inputTokens,
+    estimatedOutputTokens: outputTokens,
+    promptPreview: prompt.slice(0, 120),
+  });
+
+  // Cache Tier 2 responses that succeeded and produced output
+  if (
+    tierDecision.cacheable &&
+    agentResponse &&
+    output !== 'error' &&
+    !hadError
+  ) {
+    setCacheEntry(tierDecision.cacheKey, agentResponse);
+  }
 
   if (output === 'error' || hadError) {
     // If we already sent output to the user, don't roll back the cursor —
@@ -269,6 +373,7 @@ async function runAgent(
   group: RegisteredGroup,
   prompt: string,
   chatJid: string,
+  model?: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
@@ -320,6 +425,7 @@ async function runAgent(
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
+        model,
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -418,7 +524,13 @@ async function startMessageLoop(): Promise<void> {
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend, TIMEZONE);
+          const baseFormatted = formatMessages(messagesToSend, TIMEZONE);
+          const pipeBudgetCtx = group.isMain
+            ? getBudgetContext(messagesToSend)
+            : null;
+          const formatted = pipeBudgetCtx
+            ? `${pipeBudgetCtx}\n\n${baseFormatted}`
+            : baseFormatted;
 
           if (queue.sendMessage(chatJid, formatted)) {
             logger.debug(
@@ -462,6 +574,38 @@ function recoverPendingMessages(): void {
       );
       queue.enqueueMessageCheck(chatJid);
     }
+  }
+}
+
+const BUDGET_QUERY_SCRIPT = path.join(
+  process.cwd(),
+  'scripts',
+  'budget-query.py',
+);
+
+function getBudgetContext(_messages: NewMessage[]): string | null {
+  try {
+    const run = (args: string) =>
+      execSync(`python3 ${BUDGET_QUERY_SCRIPT} ${args}`, { timeout: 8000 })
+        .toString()
+        .trim();
+
+    const week = run('week');
+    const pending = run('pending');
+    const recent = run('recent 15');
+
+    return [
+      "=== Budget Data (live from local database — use this to answer Grady's question) ===",
+      week,
+      '',
+      pending,
+      '',
+      recent,
+      '=== End Budget Data ===',
+    ].join('\n');
+  } catch (err) {
+    logger.warn({ err }, 'Budget context query failed');
+    return null;
   }
 }
 
@@ -536,8 +680,22 @@ async function main(): Promise<void> {
     }
   }
 
+  // /cost command handler — replies with estimated spend for the last 7 days
+  async function handleCostCommand(chatJid: string): Promise<void> {
+    const channel = findChannel(channels, chatJid);
+    if (!channel) return;
+    try {
+      const report = getWeeklyCostReport();
+      await channel.sendMessage(chatJid, report);
+    } catch (err) {
+      logger.error({ err, chatJid }, 'Cost report error');
+    }
+  }
+
   // Channel callbacks (shared by all channels)
   const channelOpts = {
+    onRegisterGroup: (jid: string, group: RegisteredGroup) =>
+      registerGroup(jid, group),
     onMessage: (chatJid: string, msg: NewMessage) => {
       // Remote control commands — intercept before storage
       const trimmed = msg.content.trim();
@@ -546,6 +704,170 @@ async function main(): Promise<void> {
           logger.error({ err, chatJid }, 'Remote control command error'),
         );
         return;
+      }
+
+      // Cost report command — intercept before storage (registered groups only)
+      if (trimmed === '/cost' && registeredGroups[chatJid]) {
+        handleCostCommand(chatJid).catch((err) =>
+          logger.error({ err, chatJid }, 'Cost command error'),
+        );
+        return;
+      }
+
+      // Budget tracker manual poll — main group only, no trigger required
+      if (
+        /^(check (my )?transactions?|check (my )?spending|show (my )?transactions?|what did i spend|show (my )?charges)$/i.test(
+          trimmed,
+        ) &&
+        registeredGroups[chatJid]?.isMain
+      ) {
+        if (budgetTracker) {
+          const channel = findChannel(channels, chatJid);
+          budgetTracker
+            .pollNow(
+              (text) =>
+                channel?.sendMessage(chatJid, text) ?? Promise.resolve(),
+            )
+            .catch((err) =>
+              logger.error({ err, chatJid }, 'Budget pollNow error'),
+            );
+        }
+        return;
+      }
+
+      // ── Budget intercepts (main group only, handled before agent sees them) ──
+      // NOTE: Pattern matching is gated on isMain only — NOT on budgetTracker being non-null.
+      // This ensures budget commands always return here and never reach the agent, even if
+      // budgetTracker failed to initialize.
+      if (registeredGroups[chatJid]?.isMain) {
+        const clean = trimmed.replace(/^\[Reply to [^\]]+\]\s*/i, '').trim();
+        const channel = findChannel(channels, chatJid);
+        const send = (text: string) =>
+          channel
+            ?.sendMessage(chatJid, text)
+            .catch((err) =>
+              logger.error({ err, chatJid }, 'Budget reply send error'),
+            );
+        const notReady = () => {
+          send('Budget tracker is not running right now.');
+        };
+
+        // Tier 1: YES T1 / NO T1 — explicit short-id
+        const shortIdMatch = clean.match(/^(YES|NO)\s+(T\d+)$/i);
+        if (shortIdMatch) {
+          if (budgetTracker) {
+            budgetTracker
+              .handleReply(
+                shortIdMatch[1].toUpperCase() as 'YES' | 'NO',
+                shortIdMatch[2].toUpperCase(),
+              )
+              .then((reply) => {
+                if (reply) send(reply);
+              })
+              .catch((err) =>
+                logger.error({ err, chatJid }, 'Budget handleReply error'),
+              );
+          } else {
+            notReady();
+          }
+          return;
+        }
+
+        // Tier 2: Log all — always fires, no pending check
+        if (
+          /^(add|log|do)\s+(them\s+)?all$|^yes\s+to\s+all$|^(add|log)\s+everything$|^all\s+of\s+(them|those)$|^do\s+them\s+all$|^(add|log)\s+those$|^(add|log)\s+all\s+(of\s+)?(them|those)$/i.test(
+            clean,
+          )
+        ) {
+          if (budgetTracker) {
+            budgetTracker
+              .handleLogAll()
+              .then(send)
+              .catch((err) =>
+                logger.error({ err, chatJid }, 'Budget handleLogAll error'),
+              );
+          } else {
+            notReady();
+          }
+          return;
+        }
+
+        // Tier 3: Log most recent — always fires, no pending check
+        if (
+          /^(add|log)\s+it$|^(add|log)\s+that(\s+one)?$|^(add|log)\s+this(\s+one)?$|^that\s+one$|^this\s+one$|^yeah\s+(add|log)\s+it$|^yes\s+(add|log)\s+it$/i.test(
+            clean,
+          )
+        ) {
+          if (budgetTracker) {
+            budgetTracker
+              .handleLogMostRecent()
+              .then((reply) => {
+                if (reply) send(reply);
+              })
+              .catch((err) =>
+                logger.error(
+                  { err, chatJid },
+                  'Budget handleLogMostRecent error',
+                ),
+              );
+          } else {
+            notReady();
+          }
+          return;
+        }
+
+        // Tier 4: "add/log [merchant]" — fires if a matching pending tx exists
+        const merchantMatch = clean.match(/^(?:add|log)\s+(.+)$/i);
+        if (merchantMatch) {
+          const term = merchantMatch[1].trim();
+          if (
+            !/^T\d+$/i.test(term) &&
+            findPendingBudgetTransactionByMerchant(term)
+          ) {
+            if (budgetTracker) {
+              budgetTracker
+                .handleLogByMerchant(term)
+                .then((reply) => {
+                  if (reply) send(reply);
+                })
+                .catch((err) =>
+                  logger.error(
+                    { err, chatJid },
+                    'Budget handleLogByMerchant error',
+                  ),
+                );
+            } else {
+              notReady();
+            }
+            return;
+          }
+        }
+
+        // Tier 5: Generic confirmations — only fire when pending transactions exist
+        if (
+          /^(yeah|yep|yup|yes|sure|ok|okay|go\s+ahead|sounds\s+good|definitely|absolutely|do\s+it|yes\s+please)$/i.test(
+            clean,
+          )
+        ) {
+          if (getAllPendingBudgetTransactions().length > 0) {
+            if (budgetTracker) {
+              budgetTracker
+                .handleLogMostRecent()
+                .then((reply) => {
+                  if (reply) send(reply);
+                })
+                .catch((err) =>
+                  logger.error(
+                    { err, chatJid },
+                    'Budget handleLogMostRecent error',
+                  ),
+                );
+            } else {
+              notReady();
+            }
+            return;
+          }
+        }
       }
 
       // Sender allowlist drop mode: discard messages from denied senders before storing
@@ -597,6 +919,75 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Blackboard portal — attach to the SMS webhook server on port 3002
+  const smsChannel = channels.find(
+    (c): c is SmsChannel => c instanceof SmsChannel,
+  );
+  if (smsChannel) {
+    const portal = new BlackboardPortal();
+    portal.setNotifyCallback(async (jids, message) => {
+      for (const jid of jids) {
+        // 'discord_main' is a logical alias — resolve to the actual Discord main group JID
+        let targetJid = jid;
+        if (jid === 'discord_main') {
+          const mainEntry = Object.entries(registeredGroups).find(
+            ([, g]) => g.isMain,
+          );
+          if (!mainEntry) continue;
+          targetJid = mainEntry[0];
+        }
+        const ch = findChannel(channels, targetJid);
+        if (ch) {
+          await ch
+            .sendMessage(targetJid, message)
+            .catch((err) =>
+              logger.error(
+                { err, jid: targetJid },
+                'Portal: failed to send expiry notification',
+              ),
+            );
+        }
+      }
+    });
+    smsChannel.setPortal(portal);
+    logger.info('Blackboard portal attached to SMS webhook server (port 3002)');
+  } else {
+    logger.warn(
+      'Blackboard portal: SMS channel not running — portal unavailable',
+    );
+  }
+
+  // Budget tracker (Gmail → Discord → Sheets)
+  try {
+    budgetTracker = new BudgetTracker(
+      async (jid, text) => {
+        const channel = findChannel(channels, jid);
+        if (channel) await channel.sendMessage(jid, text);
+      },
+      ['sms:+18642756439'],
+    );
+    budgetTracker.start();
+  } catch (err) {
+    logger.warn(
+      { err },
+      'Budget tracker disabled (check GOOGLE_TOKEN_PATH and re-run gcal-auth.mjs)',
+    );
+  }
+
+  // Morning briefing (calendar + weather + spending — daily at 7:30am)
+  try {
+    const morningBriefing = new MorningBriefing(
+      async (jid, text) => {
+        const channel = findChannel(channels, jid);
+        if (channel) await channel.sendMessage(jid, text);
+      },
+      ['sms:+18642756439'],
+    );
+    morningBriefing.start();
+  } catch (err) {
+    logger.warn({ err }, 'Morning briefing disabled (check GOOGLE_TOKEN_PATH)');
+  }
+
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
@@ -619,6 +1010,15 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       return channel.sendMessage(jid, text);
+    },
+    sendFile: async (jid, text, filePath) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (channel.sendFile) {
+        await channel.sendFile(jid, text, filePath);
+      } else {
+        await channel.sendMessage(jid, text || '(screenshot attached)');
+      }
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

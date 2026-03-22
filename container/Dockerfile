@@ -24,14 +24,30 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    python3 \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Set Chromium path for agent-browser
+# Install Google API Python libraries
+RUN pip3 install --break-system-packages \
+    google-auth-oauthlib \
+    google-auth-httplib2 \
+    google-api-python-client
+
+# Set Chromium path for agent-browser and Playwright
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+# Skip browser download — we use the system Chromium installed above
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+# Allow standalone scripts to require() globally installed npm packages
+ENV NODE_PATH=/usr/local/lib/node_modules
 
-# Install agent-browser and claude-code globally
-RUN npm install -g agent-browser @anthropic-ai/claude-code
+# Install agent-browser, claude-code, and playwright globally
+RUN npm install -g agent-browser @anthropic-ai/claude-code playwright
+
+# Install the pw Playwright helper script
+COPY scripts/pw /usr/local/bin/pw
+RUN chmod +x /usr/local/bin/pw
 
 # Create app directory
 WORKDIR /app

@@ -6,12 +6,13 @@ import { CronExpressionParser } from 'cron-parser';
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
-import { isValidGroupFolder } from './group-folder.js';
+import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendFile?: (jid: string, text: string, filePath: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -90,6 +91,51 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
+                  );
+                }
+              } else if (
+                data.type === 'message_with_image' &&
+                data.chatJid &&
+                data.image_group_relative_path
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  try {
+                    const groupDir = resolveGroupFolderPath(sourceGroup);
+                    const filePath = path.join(
+                      groupDir,
+                      data.image_group_relative_path,
+                    );
+                    if (deps.sendFile) {
+                      await deps.sendFile(
+                        data.chatJid,
+                        data.text || '',
+                        filePath,
+                      );
+                    } else {
+                      // Fallback: send text only if channel doesn't support files
+                      await deps.sendMessage(
+                        data.chatJid,
+                        data.text || '(screenshot attached)',
+                      );
+                    }
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup, filePath },
+                      'IPC image message sent',
+                    );
+                  } catch (err) {
+                    logger.error(
+                      { chatJid: data.chatJid, sourceGroup, err },
+                      'Failed to send IPC image message',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC image message attempt blocked',
                   );
                 }
               }

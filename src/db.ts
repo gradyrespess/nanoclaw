@@ -82,6 +82,44 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    CREATE TABLE IF NOT EXISTS tier_usage (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT NOT NULL,
+      group_folder TEXT NOT NULL,
+      tier INTEGER NOT NULL,
+      model TEXT,
+      is_cache_hit INTEGER DEFAULT 0,
+      estimated_input_tokens INTEGER DEFAULT 0,
+      estimated_output_tokens INTEGER DEFAULT 0,
+      estimated_cost_usd REAL DEFAULT 0,
+      prompt_preview TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_tier_usage_timestamp ON tier_usage(timestamp);
+
+    CREATE TABLE IF NOT EXISTS response_cache (
+      cache_key TEXT PRIMARY KEY,
+      response TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      hit_count INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_cache_expires ON response_cache(expires_at);
+
+    CREATE TABLE IF NOT EXISTS budget_transactions (
+      id TEXT PRIMARY KEY,
+      email_id TEXT UNIQUE NOT NULL,
+      short_id TEXT,
+      date TEXT NOT NULL,
+      merchant TEXT NOT NULL,
+      amount REAL NOT NULL,
+      category TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      prompt_sent_at TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_budget_status ON budget_transactions(status);
+    CREATE INDEX IF NOT EXISTS idx_budget_short_id ON budget_transactions(short_id);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -138,6 +176,16 @@ function createSchema(database: Database.Database): void {
     );
   } catch {
     /* columns already exist */
+  }
+
+  // Add short_id column to budget_transactions if it doesn't exist
+  try {
+    database.exec(`ALTER TABLE budget_transactions ADD COLUMN short_id TEXT`);
+    database.exec(
+      `CREATE INDEX IF NOT EXISTS idx_budget_short_id ON budget_transactions(short_id)`,
+    );
+  } catch {
+    /* column already exists */
   }
 }
 
@@ -275,38 +323,11 @@ export function storeMessage(msg: NewMessage): void {
   );
 }
 
-/**
- * Store a message directly.
- */
-export function storeMessageDirect(msg: {
-  id: string;
-  chat_jid: string;
-  sender: string;
-  sender_name: string;
-  content: string;
-  timestamp: string;
-  is_from_me: boolean;
-  is_bot_message?: boolean;
-}): void {
-  db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    msg.id,
-    msg.chat_jid,
-    msg.sender,
-    msg.sender_name,
-    msg.content,
-    msg.timestamp,
-    msg.is_from_me ? 1 : 0,
-    msg.is_bot_message ? 1 : 0,
-  );
-}
-
 export function getNewMessages(
   jids: string[],
   lastTimestamp: string,
   botPrefix: string,
-  limit: number = 200,
+  limit: number = 50,
 ): { messages: NewMessage[]; newTimestamp: string } {
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 
@@ -342,7 +363,7 @@ export function getMessagesSince(
   chatJid: string,
   sinceTimestamp: string,
   botPrefix: string,
-  limit: number = 200,
+  limit: number = 50,
 ): NewMessage[] {
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
@@ -632,6 +653,197 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Tier usage tracking ---
+
+export interface TierUsageRow {
+  tier: number;
+  model: string | null;
+  is_cache_hit: number;
+  estimated_input_tokens: number;
+  estimated_output_tokens: number;
+  estimated_cost_usd: number;
+  group_folder: string;
+  prompt_preview: string | null;
+  timestamp: string;
+}
+
+export function logTierUsage(entry: Omit<TierUsageRow, 'id'>): void {
+  db.prepare(
+    `INSERT INTO tier_usage
+       (timestamp, group_folder, tier, model, is_cache_hit,
+        estimated_input_tokens, estimated_output_tokens, estimated_cost_usd, prompt_preview)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    entry.timestamp,
+    entry.group_folder,
+    entry.tier,
+    entry.model,
+    entry.is_cache_hit,
+    entry.estimated_input_tokens,
+    entry.estimated_output_tokens,
+    entry.estimated_cost_usd,
+    entry.prompt_preview,
+  );
+}
+
+export function getTierUsageSince(since: string): TierUsageRow[] {
+  return db
+    .prepare('SELECT * FROM tier_usage WHERE timestamp >= ? ORDER BY timestamp')
+    .all(since) as TierUsageRow[];
+}
+
+// --- Response cache ---
+
+export function getCacheEntry(key: string): string | null {
+  const now = new Date().toISOString();
+  const row = db
+    .prepare(
+      'SELECT response FROM response_cache WHERE cache_key = ? AND expires_at > ?',
+    )
+    .get(key, now) as { response: string } | undefined;
+  if (!row) return null;
+  db.prepare(
+    'UPDATE response_cache SET hit_count = hit_count + 1 WHERE cache_key = ?',
+  ).run(key);
+  return row.response;
+}
+
+export function setCacheEntry(
+  key: string,
+  response: string,
+  ttlHours = 1,
+): void {
+  const now = new Date().toISOString();
+  const expires = new Date(
+    Date.now() + ttlHours * 60 * 60 * 1000,
+  ).toISOString();
+  db.prepare(
+    `INSERT OR REPLACE INTO response_cache
+       (cache_key, response, created_at, expires_at, hit_count)
+     VALUES (?, ?, ?, ?, 0)`,
+  ).run(key, response, now, expires);
+}
+
+export function cleanExpiredCache(): void {
+  const now = new Date().toISOString();
+  db.prepare('DELETE FROM response_cache WHERE expires_at <= ?').run(now);
+}
+
+// --- Budget tracker ---
+
+export interface BudgetTransaction {
+  id: string;
+  email_id: string;
+  short_id: string | null;
+  date: string;
+  merchant: string;
+  amount: number;
+  category: string;
+  status: 'pending' | 'confirmed' | 'dismissed';
+  prompt_sent_at: string | null;
+  created_at: string;
+}
+
+export function getNextBudgetShortId(): string {
+  const current = getRouterState('budget_tx_counter');
+  const next = parseInt(current || '0', 10) + 1;
+  setRouterState('budget_tx_counter', next.toString());
+  return `T${next}`;
+}
+
+export function saveBudgetTransaction(tx: BudgetTransaction): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO budget_transactions
+       (id, email_id, short_id, date, merchant, amount, category, status, prompt_sent_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    tx.id,
+    tx.email_id,
+    tx.short_id,
+    tx.date,
+    tx.merchant,
+    tx.amount,
+    tx.category,
+    tx.status,
+    tx.prompt_sent_at,
+    tx.created_at,
+  );
+}
+
+export function getBudgetTransactionByShortId(
+  shortId: string,
+): BudgetTransaction | undefined {
+  return db
+    .prepare(
+      `SELECT * FROM budget_transactions WHERE short_id = ? AND status = 'pending'`,
+    )
+    .get(shortId) as BudgetTransaction | undefined;
+}
+
+export function getBudgetTransactionByEmailId(
+  emailId: string,
+): BudgetTransaction | undefined {
+  return db
+    .prepare('SELECT * FROM budget_transactions WHERE email_id = ?')
+    .get(emailId) as BudgetTransaction | undefined;
+}
+
+export function getPendingBudgetTransactions(): BudgetTransaction[] {
+  return db
+    .prepare(
+      `SELECT * FROM budget_transactions WHERE status = 'pending' AND prompt_sent_at IS NOT NULL ORDER BY created_at`,
+    )
+    .all() as BudgetTransaction[];
+}
+
+// All pending regardless of whether a prompt was sent (for natural-language handlers)
+export function getAllPendingBudgetTransactions(): BudgetTransaction[] {
+  return db
+    .prepare(
+      `SELECT * FROM budget_transactions WHERE status = 'pending' ORDER BY created_at`,
+    )
+    .all() as BudgetTransaction[];
+}
+
+export function findPendingBudgetTransactionByMerchant(
+  term: string,
+): BudgetTransaction | undefined {
+  return db
+    .prepare(
+      `SELECT * FROM budget_transactions WHERE status = 'pending' AND merchant LIKE ? ORDER BY created_at DESC LIMIT 1`,
+    )
+    .get(`%${term}%`) as BudgetTransaction | undefined;
+}
+
+export function setBudgetTransactionPromptSent(
+  id: string,
+  promptSentAt: string,
+): void {
+  db.prepare(
+    'UPDATE budget_transactions SET prompt_sent_at = ? WHERE id = ?',
+  ).run(promptSentAt, id);
+}
+
+export function updateBudgetTransactionStatus(
+  id: string,
+  status: 'confirmed' | 'dismissed',
+): void {
+  db.prepare('UPDATE budget_transactions SET status = ? WHERE id = ?').run(
+    status,
+    id,
+  );
+}
+
+export function getConfirmedBudgetTransactionsSince(
+  since: string,
+): BudgetTransaction[] {
+  return db
+    .prepare(
+      `SELECT * FROM budget_transactions WHERE status = 'confirmed' AND created_at >= ? ORDER BY created_at`,
+    )
+    .all(since) as BudgetTransaction[];
 }
 
 // --- JSON migration ---

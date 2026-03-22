@@ -8,6 +8,7 @@ import {
   runContainerAgent,
   writeTasksSnapshot,
 } from './container-runner.js';
+import { classifyTier } from './tier-router.js';
 import {
   getAllTasks,
   getDueTasks,
@@ -149,6 +150,27 @@ async function runTask(
   let result: string | null = null;
   let error: string | null = null;
 
+  // Classify tier for this task prompt — scheduled tasks default to Haiku
+  // but can escalate to Sonnet if the prompt contains complex task patterns.
+  const tierDecision = classifyTier(
+    [
+      {
+        id: task.id,
+        chat_jid: task.chat_jid,
+        sender: 'scheduler',
+        sender_name: 'Scheduler',
+        content: task.prompt,
+        timestamp: new Date().toISOString(),
+      },
+    ],
+    task.group_folder,
+    /* isScheduledTask = */ true,
+  );
+  logger.info(
+    { taskId: task.id, tier: tierDecision.tier, reason: tierDecision.reason },
+    'Scheduled task tier classified',
+  );
+
   // For group context mode, use the group's current session
   const sessions = deps.getSessions();
   const sessionId =
@@ -179,6 +201,7 @@ async function runTask(
         isMain,
         isScheduledTask: true,
         assistantName: ASSISTANT_NAME,
+        model: tierDecision.model ?? undefined,
       },
       (proc, containerName) =>
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),

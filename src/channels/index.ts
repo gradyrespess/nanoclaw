@@ -4,6 +4,9 @@
 // discord
 import './discord.js';
 
+// sms
+import './sms.js';
+
 // gmail
 
 // slack

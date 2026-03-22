@@ -1,0 +1,322 @@
+#!/usr/bin/env node
+'use strict';
+
+const { chromium } = require('playwright');
+const fs   = require('fs');
+const path = require('path');
+const os   = require('os');
+
+const GROUP_DIR  = '/workspace/group';
+const CREDS_FILE = path.join(GROUP_DIR, 'credentials.json');
+const AUTH_DIR   = path.join(GROUP_DIR, '.auth-states');
+const SHOTS_DIR  = path.join(os.tmpdir(), 'screenshots');
+
+// ── Credentials ───────────────────────────────────────────────────────────────
+
+function loadCreds() {
+  try { return JSON.parse(fs.readFileSync(CREDS_FILE, 'utf8')); } catch { return {}; }
+}
+function saveCreds(obj) {
+  fs.mkdirSync(GROUP_DIR, { recursive: true });
+  fs.writeFileSync(CREDS_FILE, JSON.stringify(obj, null, 2) + '\n');
+  try { fs.chmodSync(CREDS_FILE, 0o600); } catch {}
+}
+function getCred(site)  { return loadCreds()[site.toLowerCase()]; }
+function setCred(site, user, pass, url) {
+  const c = loadCreds();
+  c[site.toLowerCase()] = { username: user, password: pass, url: url || null };
+  saveCreds(c);
+  console.log(`Saved credentials for: ${site}`);
+}
+function deleteCred(site) {
+  const c = loadCreds(); delete c[site.toLowerCase()]; saveCreds(c);
+  console.log(`Deleted credentials for: ${site}`);
+}
+function listCreds() {
+  const c = loadCreds(), sites = Object.keys(c);
+  if (!sites.length) { console.log('No credentials stored.'); return; }
+  for (const s of sites) console.log(`  ${s}  username=${c[s].username}${c[s].url ? `  url=${c[s].url}` : ''}`);
+}
+
+// ── Auth state ────────────────────────────────────────────────────────────────
+
+const authPath = site => path.join(AUTH_DIR, `${site.toLowerCase()}.json`);
+const hasAuth  = site => fs.existsSync(authPath(site));
+
+async function saveAuth(ctx, site) {
+  fs.mkdirSync(AUTH_DIR, { recursive: true });
+  await ctx.storageState({ path: authPath(site) });
+  try { fs.chmodSync(authPath(site), 0o600); } catch {}
+  console.log(`Auth state saved for: ${site}  (${authPath(site)})`);
+}
+
+// ── Browser helpers ───────────────────────────────────────────────────────────
+
+const launchOpts = () => ({
+  executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+                  || process.env.AGENT_BROWSER_EXECUTABLE_PATH
+                  || '/usr/bin/chromium',
+  headless: true,
+  args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu'],
+});
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function retry(fn, n = 3, d = 1500) {
+  let last;
+  for (let i = 0; i < n; i++) {
+    try { return await fn(); } catch (e) { last = e; if (i < n-1) await sleep(d * 2**i); }
+  }
+  throw last;
+}
+
+const navigate = (page, url, opts = {}) =>
+  retry(() => page.goto(url, { waitUntil: 'networkidle', timeout: 30_000, ...opts }));
+
+async function tryFill(page, sels, val, t = 3000) {
+  for (const s of sels) {
+    try { await page.fill(s, val, { timeout: t }); return s; } catch {}
+  }
+  return null;
+}
+
+function flagVal(args, flag) { const i = args.indexOf(flag); return i !== -1 ? args[i+1] : null; }
+function ctxOpts(authSite)   { return authSite && hasAuth(authSite) ? { storageState: authPath(authSite) } : {}; }
+
+// ── Login ─────────────────────────────────────────────────────────────────────
+
+const EMAIL_SELS = [
+  'input[type="email"]','input[name="email"]','input[name="username"]','input[name="login"]',
+  'input[id*="email" i]','input[id*="user" i]','input[placeholder*="email" i]',
+  'input[placeholder*="username" i]','input[autocomplete="email"]','input[autocomplete="username"]',
+];
+const PASS_SELS = [
+  'input[type="password"]','input[name="password"]','input[name="pass"]',
+  'input[id*="password" i]','input[placeholder*="password" i]','input[autocomplete="current-password"]',
+];
+
+async function standardLogin(page, user, pass) {
+  if (!await tryFill(page, EMAIL_SELS, user)) return false;
+  let psel = await tryFill(page, PASS_SELS, pass, 1000);
+  if (!psel) {
+    for (const s of ['button[type="submit"]','input[type="submit"]','[id*="next" i]','[id*="continue" i]']) {
+      try { await page.click(s, { timeout: 2000 }); break; } catch {}
+    }
+    await sleep(1500);
+    psel = await tryFill(page, PASS_SELS, pass, 5000);
+    if (!psel) return false;
+  }
+  await page.keyboard.press('Enter');
+  await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 20_000 }).catch(() => {});
+  return true;
+}
+
+const DUO_DOMAINS = ['duosecurity.com', 'duo.sc.edu'];
+const duoPrompt   = (page, url = page.url()) =>
+  DUO_DOMAINS.some(d => url.includes(d)) || page.frames().some(f => DUO_DOMAINS.some(d => f.url().includes(d)));
+
+async function sendIpcMessage(text) {
+  const messagesDir = '/workspace/ipc/messages';
+  try {
+    fs.mkdirSync(messagesDir, { recursive: true });
+    const file = path.join(messagesDir, `duo-notify-${Date.now()}.json`);
+    fs.writeFileSync(file, JSON.stringify({
+      type: 'message',
+      chatJid: 'dc:1484008410729943093',
+      text,
+    }));
+  } catch (e) {
+    console.log('(Could not send IPC message:', e.message + ')');
+  }
+}
+
+async function waitForDuo(page, startUrl) {
+  console.log('Duo push sent — sending Discord notification and waiting 60 seconds…');
+  await sendIpcMessage('Please approve the Duo push on your phone');
+  await sleep(60_000);
+  const url = page.url();
+  if (!duoPrompt(page, url) && url !== startUrl) { console.log('Duo approved.'); return true; }
+  // Give a little more time if still on Duo page
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    await sleep(1500);
+    const url = page.url();
+    if (!duoPrompt(page, url) && url !== startUrl) { console.log('Duo approved.'); return true; }
+  }
+  return false;
+}
+
+async function cmdLogin(site, overrideUrl) {
+  const cred = getCred(site);
+  if (!cred) { console.error(`No credentials for "${site}". Run: pw creds set ${site} <user> <pass> [url]`); process.exit(1); }
+  const url = overrideUrl || cred.url;
+  if (!url)  { console.error(`No login URL for "${site}". Provide one: pw login ${site} https://...`); process.exit(1); }
+
+  const browser = await chromium.launch(launchOpts());
+  try {
+    const ctx = await browser.newContext(), page = await ctx.newPage();
+    await navigate(page, url);
+    const urlAfterNav = page.url();
+    const isMSFT   = () => /login\.(microsoftonline|live)\.com/.test(page.url());
+    const isGoogle = () => page.url().includes('accounts.google.com');
+
+    if (isMSFT()) {
+      console.log('Microsoft login page detected');
+      if (!await standardLogin(page, cred.username, cred.password)) { console.error('Could not fill Microsoft login form automatically.'); process.exit(1); }
+      await sleep(2000);
+      if (isMSFT()) { console.error('MFA required — complete it interactively then use: pw auth save ' + site); process.exit(2); }
+    } else if (isGoogle()) {
+      console.log('Google login page detected');
+      if (!await standardLogin(page, cred.username, cred.password)) { console.error('Could not fill Google login form automatically.'); process.exit(1); }
+    } else {
+      if (!await standardLogin(page, cred.username, cred.password)) {
+        console.error('Could not find login form fields on page.\nTip: Use agent-browser interactively then run: pw auth save ' + site);
+        process.exit(1);
+      }
+    }
+
+    await sleep(2000);
+    if (duoPrompt(page)) {
+      if (!await waitForDuo(page, urlAfterNav)) { console.error('Duo approval timed out (75 s). Run again once you are ready to approve.'); process.exit(2); }
+    }
+    await saveAuth(ctx, site);
+    console.log(`Login successful. Current URL: ${page.url()}`);
+  } finally { await browser.close(); }
+}
+
+// Converts a Cookie-Editor JSON export (Chrome/Firefox) → Playwright storage state
+function cmdAuthImport(site, file) {
+  if (!file) { console.error('Usage: pw auth import <site> <cookies.json>'); process.exit(1); }
+  let raw;
+  try { raw = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { console.error('Could not read file: ' + e.message); process.exit(1); }
+  const SAME_SITE = { strict: 'Strict', lax: 'Lax', no_restriction: 'None', unspecified: 'None' };
+  const cookies = raw.map(c => ({
+    name:     c.name,
+    value:    c.value,
+    domain:   c.domain,
+    path:     c.path || '/',
+    expires:  c.expirationDate || -1,
+    httpOnly: !!c.httpOnly,
+    secure:   !!c.secure,
+    sameSite: SAME_SITE[c.sameSite] || 'None',
+  }));
+  const state = { cookies, origins: [] };
+  fs.mkdirSync(AUTH_DIR, { recursive: true });
+  const out = authPath(site);
+  fs.writeFileSync(out, JSON.stringify(state, null, 2) + '\n');
+  try { fs.chmodSync(out, 0o600); } catch {}
+  console.log(`Imported ${cookies.length} cookies for "${site}"  →  ${out}`);
+}
+
+// ── Read commands ─────────────────────────────────────────────────────────────
+
+async function cmdScreenshot(url, args) {
+  const out = args.filter(a => !a.startsWith('-'))[0] || path.join(SHOTS_DIR, `screenshot-${Date.now()}.png`);
+  [path.dirname(out), SHOTS_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
+  const browser = await chromium.launch(launchOpts());
+  try {
+    const page = await (await browser.newContext(ctxOpts(flagVal(args, '--auth')))).newPage();
+    await retry(() => navigate(page, url));
+    await page.screenshot({ path: out, fullPage: args.includes('--full') });
+    console.log(out);
+  } finally { await browser.close(); }
+}
+
+async function cmdExtract(url, expr, args) {
+  const browser = await chromium.launch(launchOpts());
+  try {
+    const page = await (await browser.newContext(ctxOpts(flagVal(args, '--auth')))).newPage();
+    await retry(() => navigate(page, url));
+    console.log(JSON.stringify(await page.evaluate(expr), null, 2));
+  } finally { await browser.close(); }
+}
+
+async function cmdHtml(url, sel, args) {
+  const browser = await chromium.launch(launchOpts());
+  try {
+    const page = await (await browser.newContext(ctxOpts(flagVal(args, '--auth')))).newPage();
+    await retry(() => navigate(page, url));
+    if (sel) {
+      console.log((await Promise.all((await page.$$(sel)).map(e => e.evaluate(n => n.outerHTML)))).join('\n'));
+    } else { console.log(await page.content()); }
+  } finally { await browser.close(); }
+}
+
+async function cmdLinks(url, args) {
+  const browser = await chromium.launch(launchOpts());
+  try {
+    const page = await (await browser.newContext(ctxOpts(flagVal(args, '--auth')))).newPage();
+    await retry(() => navigate(page, url));
+    console.log(JSON.stringify(await page.evaluate(() =>
+      [...document.querySelectorAll('a[href]')]
+        .map(a => ({ text: a.textContent.trim(), href: a.href }))
+        .filter(l => l.href && !l.href.startsWith('javascript'))
+    ), null, 2));
+  } finally { await browser.close(); }
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+async function main() {
+  const [,, cmd, ...rest] = process.argv;
+  switch (cmd) {
+    case 'creds': {
+      const [sub, ...a] = rest;
+      if      (sub === 'set')    { const [s,u,p,url] = a; if (!s||!u||!p) { console.error('Usage: pw creds set <site> <user> <pass> [url]'); process.exit(1); } setCred(s,u,p,url); }
+      else if (sub === 'get')    { const c = getCred(a[0]); console.log(c ? JSON.stringify({ username: c.username, url: c.url }) : 'Not found'); }
+      else if (sub === 'list')   { listCreds(); }
+      else if (sub === 'delete') { deleteCred(a[0]); }
+      else { console.error('Usage: pw creds set|get|list|delete ...'); process.exit(1); }
+      break;
+    }
+    case 'auth': {
+      const [sub, site] = rest;
+      if (sub === 'clear') {
+        const p = authPath(site);
+        if (fs.existsSync(p)) { fs.unlinkSync(p); console.log(`Cleared auth state for: ${site}`); }
+        else console.log('No saved state found.');
+      } else if (sub === 'list') {
+        if (!fs.existsSync(AUTH_DIR)) { console.log('No auth states saved.'); break; }
+        const files = fs.readdirSync(AUTH_DIR).filter(f => f.endsWith('.json'));
+        files.length ? files.forEach(f => console.log('  ' + f.replace('.json', ''))) : console.log('No auth states saved.');
+      } else if (sub === 'import') { cmdAuthImport(site, rest[2]); }
+      else { console.error('Usage: pw auth list|clear|import <site> [file]'); process.exit(1); }
+      break;
+    }
+    case 'login': {
+      const [site, url] = rest;
+      if (!site) { console.error('Usage: pw login <site> [loginUrl]'); process.exit(1); }
+      await cmdLogin(site, url);
+      break;
+    }
+    case 'screenshot': {
+      const [url, ...args] = rest;
+      if (!url) { console.error('Usage: pw screenshot <url> [out.png] [--full] [--auth <site>]'); process.exit(1); }
+      await cmdScreenshot(url, args);
+      break;
+    }
+    case 'extract': {
+      const [url, expr, ...args] = rest;
+      if (!url || !expr) { console.error("Usage: pw extract <url> '<js-expr>' [--auth <site>]"); process.exit(1); }
+      await cmdExtract(url, expr, args);
+      break;
+    }
+    case 'html': {
+      const [url, ...args] = rest;
+      if (!url) { console.error('Usage: pw html <url> [selector] [--auth <site>]'); process.exit(1); }
+      await cmdHtml(url, args.filter(a => !a.startsWith('-'))[0], args);
+      break;
+    }
+    case 'links': {
+      const [url, ...args] = rest;
+      if (!url) { console.error('Usage: pw links <url> [--auth <site>]'); process.exit(1); }
+      await cmdLinks(url, args);
+      break;
+    }
+    default:
+      console.error(`Unknown command: ${cmd || '(none)'}\nCommands: creds, auth, login, screenshot, extract, html, links`);
+      process.exit(1);
+  }
+}
+
+main().catch(err => { console.error(err.message || err); process.exit(1); });

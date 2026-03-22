@@ -26,6 +26,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -41,6 +42,8 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  /** Model override for tiered intelligence. Falls back to ANTHROPIC_MODEL env var. */
+  model?: string;
 }
 
 export interface ContainerOutput {
@@ -215,6 +218,7 @@ function buildVolumeMounts(
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  modelOverride?: string,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
@@ -236,6 +240,13 @@ function buildContainerArgs(
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  // Model: per-invocation override → env file → SDK default
+  const model =
+    modelOverride || readEnvFile(['ANTHROPIC_MODEL']).ANTHROPIC_MODEL;
+  if (model) {
+    args.push('-e', `ANTHROPIC_MODEL=${model}`);
   }
 
   // Runtime-specific args for host gateway resolution
@@ -278,7 +289,7 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+  const containerArgs = buildContainerArgs(mounts, containerName, input.model);
 
   logger.debug(
     {
@@ -664,8 +675,14 @@ export function writeTasksSnapshot(
     ? tasks
     : tasks.filter((t) => t.groupFolder === groupFolder);
 
+  // Truncate prompt previews so reading this file doesn't flood the context window
+  const compactTasks = filteredTasks.map((t) => ({
+    ...t,
+    prompt: t.prompt.length > 150 ? t.prompt.slice(0, 150) + '…' : t.prompt,
+  }));
+
   const tasksFile = path.join(groupIpcDir, 'current_tasks.json');
-  fs.writeFileSync(tasksFile, JSON.stringify(filteredTasks, null, 2));
+  fs.writeFileSync(tasksFile, JSON.stringify(compactTasks));
 }
 
 export interface AvailableGroup {
@@ -695,13 +712,9 @@ export function writeGroupsSnapshot(
   const groupsFile = path.join(groupIpcDir, 'available_groups.json');
   fs.writeFileSync(
     groupsFile,
-    JSON.stringify(
-      {
-        groups: visibleGroups,
-        lastSync: new Date().toISOString(),
-      },
-      null,
-      2,
-    ),
+    JSON.stringify({
+      groups: visibleGroups,
+      lastSync: new Date().toISOString(),
+    }),
   );
 }
