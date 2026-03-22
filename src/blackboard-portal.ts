@@ -263,42 +263,59 @@ h1{font-size:1.55rem;font-weight:700;margin-bottom:12px}
 <h1>Blackboard Login</h1>
 <p class="sub">Tap the button below to log into Blackboard. Come back to this page after logging in.</p>
 
-<button class="btn btn-open" id="openBtn" onclick="openBB()">Open Blackboard Login</button>
-<button class="btn btn-grab" id="grabBtn" onclick="grab()">I've logged in — grab my session</button>
+<button class="btn btn-open" id="openBtn">Open Blackboard Login</button>
+<button class="btn btn-grab" id="grabBtn">I've logged in — grab my session</button>
 
 <div class="status" id="status"></div>
 
 <script>
-function openBB(){
-  window.open('https://blackboard.sc.edu','_blank');
-  document.getElementById('grabBtn').style.display='block';
-  document.getElementById('status').textContent='Log in on Blackboard, then come back and tap the button above.';
-}
-async function grab(){
-  const grabBtn=document.getElementById('grabBtn');
-  const status=document.getElementById('status');
-  grabBtn.disabled=true;
-  status.className='status';
-  status.innerHTML='<span class="spin"></span>Grabbing your session… (up to 60 seconds)';
-  try{
-    const r=await fetch('/blackboard-grab',{method:'POST'});
-    const d=await r.json();
-    if(d.ok){
-      status.textContent='✅ Session refreshed! You can close this page.';
-      status.className='status ok';
-      grabBtn.style.display='none';
-      document.getElementById('openBtn').style.display='none';
-    }else{
-      status.textContent='❌ '+(d.error||'Login failed — try again');
-      status.className='status err';
-      grabBtn.disabled=false;
+document.getElementById('openBtn').addEventListener('click', function() {
+  window.open('https://blackboard.sc.edu', '_blank');
+  document.getElementById('grabBtn').style.display = 'block';
+  document.getElementById('status').textContent = 'Log in on Blackboard, then come back and tap the button above.';
+});
+
+document.getElementById('grabBtn').addEventListener('click', function() {
+  console.log('[portal] grab button tapped');
+
+  var grabBtn = document.getElementById('grabBtn');
+  var status = document.getElementById('status');
+
+  grabBtn.disabled = true;
+  status.className = 'status';
+  status.innerHTML = '<span class="spin"></span>Grabbing session\u2026 (up to 60 seconds)';
+
+  fetch('/blackboard-grab', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' }
+  })
+  .then(function(r) {
+    console.log('[portal] fetch response status:', r.status);
+    return r.text();
+  })
+  .then(function(text) {
+    console.log('[portal] response body:', text);
+    var d;
+    try { d = JSON.parse(text); } catch(e) { d = {}; }
+    if (d.ok) {
+      status.textContent = '\u2705 Session refreshed! You can close this page.';
+      status.className = 'status ok';
+      grabBtn.style.display = 'none';
+      document.getElementById('openBtn').style.display = 'none';
+    } else {
+      status.textContent = '\u274c ' + (d.error || 'Login failed \u2014 try again');
+      status.className = 'status err';
+      grabBtn.disabled = false;
     }
-  }catch(e){
-    status.textContent='❌ Network error — try again';
-    status.className='status err';
-    grabBtn.disabled=false;
-  }
-}
+  })
+  .catch(function(e) {
+    console.error('[portal] fetch error:', e);
+    status.textContent = '\u274c Network error: ' + e.message;
+    status.className = 'status err';
+    grabBtn.disabled = false;
+  });
+});
 </script>
 </body>
 </html>`;
@@ -400,7 +417,7 @@ export class BlackboardPortal {
     logger.info('Blackboard portal: PIN verified, session created');
     res.writeHead(200, {
       'Content-Type': 'application/json',
-      'Set-Cookie': `bb_portal=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=1800`,
+      'Set-Cookie': `bb_portal=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=1800`,
     });
     res.end(JSON.stringify({ ok: true }));
   }

@@ -610,8 +610,10 @@ function getBudgetContext(_messages: NewMessage[]): string | null {
 }
 
 function ensureContainerSystemRunning(): void {
-  ensureContainerRuntimeRunning();
-  cleanupOrphans();
+  const runtimeAvailable = ensureContainerRuntimeRunning();
+  if (runtimeAvailable) {
+    cleanupOrphans();
+  }
 }
 
 async function main(): Promise<void> {
