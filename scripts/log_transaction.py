@@ -16,8 +16,8 @@ DB_PATH   = os.path.join(BASE_DIR, '..', 'store', 'messages.db')
 TOKEN_PATH = os.path.join(BASE_DIR, '.gcal-token.json')
 SHEETS_ID  = '1XfQBEUbvf9JYpVgXlG6GGvKqhElG5B2OAgHgk-luT4M'
 SHEETS_RANGE = 'Sheet1!A:D'
-CLIENT_ID     = '103337039969-r3l429rdkvs2ndul3sujmvecmh8amtri.apps.googleusercontent.com'
-CLIENT_SECRET = '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'
+CLIENT_ID     = os.environ.get('GOOGLE_CLIENT_ID', '')
+CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET', '')
 
 def main():
     if len(sys.argv) < 2:

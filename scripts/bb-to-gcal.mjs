@@ -30,8 +30,8 @@ const LOGIN_SCRIPT    = path.join(__dirname, 'bb-login.mjs');
 const SESSION_MAX_AGE_MS = 2.5 * 60 * 60 * 1000;
 
 const OAUTH_CREDS = {
-  client_id:    '103337039969-r3l429rdkvs2ndul3sujmvecmh8amtri.apps.googleusercontent.com',
-  client_secret:'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',
+  client_id:    process.env.GOOGLE_CLIENT_ID,
+  client_secret:process.env.GOOGLE_CLIENT_SECRET,
   redirect_uri: 'http://localhost:3456',
 };
 

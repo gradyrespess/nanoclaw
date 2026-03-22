@@ -65,8 +65,8 @@ def _notify_bb_expired():
     except Exception as e:
         print(f'  ⚠️  Could not send expiry notification: {e}')
 
-OAUTH_CLIENT_ID     = '103337039969-r3l429rdkvs2ndul3sujmvecmh8amtri.apps.googleusercontent.com'
-OAUTH_CLIENT_SECRET = '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'
+OAUTH_CLIENT_ID     = os.environ.get('GOOGLE_CLIENT_ID', _env.get('GOOGLE_CLIENT_ID', ''))
+OAUTH_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET', _env.get('GOOGLE_CLIENT_SECRET', ''))
 OAUTH_REDIRECT_URI  = 'http://localhost:3456'
 
 SEMESTER_FILTER   = 'SPRING-2026'

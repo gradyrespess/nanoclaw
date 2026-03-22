@@ -4,9 +4,8 @@ import path from 'path';
 
 import { logger } from './logger.js';
 
-const OAUTH_CLIENT_ID =
-  '103337039969-r3l429rdkvs2ndul3sujmvecmh8amtri.apps.googleusercontent.com';
-const OAUTH_CLIENT_SECRET = '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';
+const OAUTH_CLIENT_ID = process.env.GOOGLE_CLIENT_ID ?? '';
+const OAUTH_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET ?? '';
 const OAUTH_REDIRECT_URI = 'http://localhost:3456';
 
 export const DEFAULT_GOOGLE_TOKEN_PATH =
